@@ -19,7 +19,7 @@ app = FastAPI(title="for survey 集計API")
 # CORS設定（WADAXのサイトからアクセスできるようにする）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 本番環境では "https://www.pileup-datalib.com" に変更
+    allow_origins=["https://www.pileup-datalib.com", "http://localhost", "http://127.0.0.1"],   # 本番環境では "https://www.pileup-datalib.com" に変更
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
