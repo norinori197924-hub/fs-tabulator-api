@@ -19,7 +19,7 @@ app = FastAPI(title="for survey 集計API")
 # CORS設定（WADAXのサイトからアクセスできるようにする）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.pileup-datalib.com", "http://localhost", "http://127.0.0.1"],   # 本番環境では "https://www.pileup-datalib.com" に変更
+    allow_origins=["*"],   # 本番環境では "https://www.pileup-datalib.com" に変更
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -233,12 +233,18 @@ def build_gt_excel(meta, questions, data, hi, target_qids, filepath):
         q = questions.get(qid)
         if not q: continue
         qt = detect_type(q)
-        if qt in ('FA','D'): continue
+        if qt == 'D': continue
         q_row_map[qid] = cur_row
         if qt == 'SA':
             nc = len([k for k in q.get('items',{}) if k != ''])
-        else:
+        elif qt == 'MA':
             nc = len([s for s in q.get('sub_items',[]) if s['item'] in hi])
+        elif qt == 'FA':
+            col_idx = hi.get(qid)
+            nc = sum(1 for r in data if col_idx is not None and col_idx<len(r) and r[col_idx].strip())
+            nc = min(nc, 200)
+        else:
+            nc = 0
         cur_row += 1 + 1 + nc + 1
 
     toc_row = 9; no = 1
@@ -246,7 +252,7 @@ def build_gt_excel(meta, questions, data, hi, target_qids, filepath):
         q = questions.get(qid)
         if not q: continue
         qt = detect_type(q)
-        if qt in ('FA','D'): continue
+        if qt == 'D': continue
         bg = C['toc_odd'] if no%2==0 else C['toc_even']
         dest_row = q_row_map.get(qid,3)
         ws_toc.row_dimensions[toc_row].height = 17
@@ -255,7 +261,7 @@ def build_gt_excel(meta, questions, data, hi, target_qids, filepath):
         lc.hyperlink = f"#{SNAME}!A{dest_row}"
         lc.font = Font(bold=True,color=C['link_fg'],underline='single',size=9,name='Arial')
         lc.fill = hf(bg); lc.alignment = al('center'); lc.border = thin()
-        badge = {'SA':'SA（単択）','MA':'MA（複数）'}.get(qt,qt)
+        badge = {'SA':'SA（単択）','MA':'MA（複数）','FA':'FA（自由記述）'}.get(qt,qt)
         ac(ws_toc,toc_row,4,badge,bg=bg,h='center')
         ac(ws_toc,toc_row,5,(q.get('label','') or '')[:40],bg=bg)
         if qt == 'SA': nc = len([k for k in q.get('items',{}) if k!=''])
@@ -287,7 +293,7 @@ def build_gt_excel(meta, questions, data, hi, target_qids, filepath):
         q = questions.get(qid)
         if not q: continue
         qt = detect_type(q)
-        if qt in ('FA','D'): continue
+        if qt == 'D': continue  # D型のみスキップ
 
         ws.row_dimensions[row].height = 28
         ws.merge_cells(start_row=row,start_column=1,end_row=row,end_column=4)
@@ -336,7 +342,31 @@ def build_gt_excel(meta, questions, data, hi, target_qids, filepath):
                 pc = ac(ws,row,5,fmt_pct(pct),bg=bg,h='center')
                 if pct >= 50: pc.fill = hf(C['hi_green'])
                 row += 1
-        row += 1
+        elif qt == 'FA':
+            # FA：回答テキストを一覧で出力
+            col_idx = hi.get(qid)
+            fa_responses = []
+            if col_idx is not None:
+                for r in data:
+                    v = (r[col_idx] if col_idx < len(r) else '').strip()
+                    if v: fa_responses.append(v)
+            ac(ws,row,1,qid,bg=C['row_odd'],fg='888888',h='center')
+            ac(ws,row,2,'',bg=C['row_odd'])
+            ac(ws,row,3,f'※ 自由記述（回答数: {len(fa_responses)}件）',bg=C['row_odd'],fg='555555')
+            ac(ws,row,4,len(fa_responses),bg=C['row_odd'],h='center',fg='555555')
+            ac(ws,row,5,'',bg=C['row_odd'])
+            row += 1
+            for oi,txt in enumerate(fa_responses[:200]):  # 最大200件
+                bg = C['row_odd'] if oi%2==0 else C['row_even']
+                ws.row_dimensions[row].height = 15
+                ac(ws,row,1,qid,bg=bg,fg='888888',h='center')
+                ac(ws,row,2,'',bg=bg)
+                ws.merge_cells(start_row=row,start_column=3,end_row=row,end_column=5)
+                tc = ws.cell(row,3,txt[:100])
+                tc.font = Font(size=9,name='Arial'); tc.fill = hf(bg)
+                tc.alignment = al('left',wrap=False); tc.border = thin()
+                row += 1
+        row += 1  # 設問間スペース
 
     wb.save(filepath)
 
@@ -480,18 +510,19 @@ def health():
 async def tabulate(
     layout_file: UploadFile = File(...),
     rawdata_file: UploadFile = File(...),
-    output_type: str = Form("both"),      # "gt" / "cross" / "both"
-    cross_pairs: str = Form(""),          # "F1,Q1|F1,Q4|SC1,Q1" のようにパイプ区切り
+    output_type: str = Form("both"),
+    cross_pairs: str = Form(""),
+    gt_qids: str = Form(""),
+    filters: str = Form(""),
+    filter_logic: str = Form("and"),
 ):
     """
     レイアウト・ローデータをアップロードして集計Excelを返す
     """
-    # 一時ディレクトリに保存
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        # ファイルをShift-JISで読み込む
-        layout_bytes  = await layout_file.read()
-        rawdata_bytes = await rawdata_file.read()
+    # form_dataの代わりに直接パラメータを使う
+    import json as _json
+    layout_bytes  = await layout_file.read()
+    rawdata_bytes = await rawdata_file.read()
 
         layout_text  = layout_bytes.decode(ENCODING, errors='replace')
         rawdata_text = rawdata_bytes.decode(ENCODING, errors='replace')
@@ -504,10 +535,50 @@ async def tabulate(
             raise HTTPException(status_code=400,
                 detail="有効回答（COMP）が見つかりません。ファイルを確認してください。")
 
-        # 集計対象設問
+        # ① GT集計対象設問（UIのON/OFFを反映）
         skip = {'MID','START','END','TIME','STA','GATE'}
-        target_qids = [q for q in questions
-                       if q not in skip and detect_type(questions[q]) in ('SA','MA')]
+        all_qids = [q for q in questions if q not in skip]
+
+        if gt_qids:
+            try:
+                gt_on = _json.loads(gt_qids)
+                target_qids = [q for q in gt_on if q in questions]
+            except:
+                target_qids = [q for q in all_qids if detect_type(questions[q]) in ('SA','MA','FA')]
+        else:
+            target_qids = [q for q in all_qids if detect_type(questions[q]) in ('SA','MA','FA')]
+
+        # ② 絞り込み条件を適用
+        if filters:
+            try:
+                filter_conds = _json.loads(filters)
+                filtered_data = []
+                for row in data:
+                    results_f = []
+                    for cond in filter_conds:
+                        qid_f = cond.get('qid','')
+                        op    = cond.get('op','eq')
+                        val   = str(cond.get('val',''))
+                        col_i = hi.get(qid_f)
+                        v = (row[col_i] if col_i is not None and col_i < len(row) else '').strip()
+                        if op=='eq':  results_f.append(v==val)
+                        elif op=='neq': results_f.append(v!=val)
+                        elif op=='gte': results_f.append(float(v or 0)>=float(val or 0))
+                        elif op=='lte': results_f.append(float(v or 0)<=float(val or 0))
+                        else: results_f.append(v==val)
+                    if not results_f:
+                        filtered_data.append(row)
+                        continue
+                    combined = results_f[0]
+                    for i in range(1, len(results_f)):
+                        logic_i = filter_conds[i].get('logic', filter_logic)
+                        if logic_i=='or': combined = combined or results_f[i]
+                        else: combined = combined and results_f[i]
+                    if combined:
+                        filtered_data.append(row)
+                data = filtered_data
+            except:
+                pass
 
         # クロスペア
         pairs = []
@@ -516,9 +587,8 @@ async def tabulate(
                 parts = pair.split(',')
                 if len(parts) == 2:
                     pairs.append((parts[0].strip(), parts[1].strip()))
-        if not pairs:
-            # デフォルトペア（先頭SA × 全SA/MA）
-            sa_qs = [q for q in target_qids if detect_type(questions[q])=='SA'][:3]
+        if not pairs and output_type in ('cross','both'):
+            sa_qs = [q for q in target_qids if detect_type(questions[q])=='SA']
             for ax in sa_qs[:1]:
                 for tg in target_qids[:4]:
                     if ax != tg:
